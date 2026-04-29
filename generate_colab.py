@@ -145,6 +145,7 @@ git_clone_with_retry(
     "omegaconf" \\
     "einops" \\
     "rembg>=2.0.50,<2.0.70" \\
+    "onnxruntime" \\
     "xatlas" \\
     "plyfile" \\
     "PyMCubes" \\
@@ -249,7 +250,7 @@ generating.
 
 PREFLIGHT_PY = """\
 import os
-import importlib.util
+import importlib
 
 problems = []
 
@@ -271,15 +272,22 @@ for f in required_weights:
     elif os.path.getsize(p) < 100 * 1024 * 1024:  # < 100 MB = clearly truncated
         problems.append(f"Weight looks truncated: {f} ({os.path.getsize(p)} bytes)")
 
-# 3. Critical Python deps (the ones that have failed for us in the past)
+# 3. Critical Python deps. We *actually import* each one rather than just
+#    locating the package on disk, because some packages (e.g. rembg) have
+#    transitive imports in their __init__.py (onnxruntime) that find_spec
+#    will not catch -- it'd say "rembg is installed" while `import rembg`
+#    is broken. Importing here fails fast in the pre-flight cell instead
+#    of silently dropping into MOCK mode at server startup.
 required_modules = [
     "torch", "diffusers", "transformers", "rembg",
     "omegaconf", "einops", "pytorch_lightning",
     "nvdiffrast", "xatlas", "imageio",
 ]
 for mod in required_modules:
-    if importlib.util.find_spec(mod) is None:
-        problems.append(f"Python module missing: {mod}")
+    try:
+        importlib.import_module(mod)
+    except Exception as e:
+        problems.append(f"Python module broken: {mod} ({type(e).__name__}: {e})")
 
 if problems:
     print("PRE-FLIGHT FAILED:")
