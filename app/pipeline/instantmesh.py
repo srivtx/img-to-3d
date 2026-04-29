@@ -188,10 +188,35 @@ class CoarseGenerator:
         torch_dtype = torch.float16 if (FP16 and device.type == "cuda") else torch.float32
 
         # ---- Diffusion pipeline (zero123plus + custom UNet) ----------
+        # InstantMesh's reference run.py passes custom_pipeline="zero123plus".
+        # That short name makes Diffusers look in the community-pipelines
+        # mirror at v{diffusers_version}/zero123plus.py -- which 404s on
+        # modern Diffusers because zero123plus.py was never published to
+        # that mirror at recent versions. Fortunately InstantMesh vendors
+        # its own copy of pipeline.py at zero123plus/pipeline.py inside
+        # the cloned repo, so we point custom_pipeline at that absolute
+        # local file. Diffusers will load the class from disk and skip
+        # the network lookup entirely.
+        local_pipeline_py = INSTANTMESH_CODE_DIR / "zero123plus" / "pipeline.py"
+        if local_pipeline_py.is_file():
+            custom_pipeline_arg: str = str(local_pipeline_py)
+            print(
+                f"[InstantMesh] Using vendored zero123plus pipeline at "
+                f"{custom_pipeline_arg}"
+            )
+        else:
+            # Fall back to the upstream short name -- will fail on modern
+            # Diffusers but at least the error message is informative.
+            custom_pipeline_arg = "zero123plus"
+            print(
+                f"[InstantMesh] WARNING: vendored pipeline.py not found at "
+                f"{local_pipeline_py}, falling back to community pipeline name"
+            )
+
         print(f"[InstantMesh] Loading zero123plus pipeline (dtype={torch_dtype})")
         pipeline = DiffusionPipeline.from_pretrained(
             "sudo-ai/zero123plus-v1.2",
-            custom_pipeline="zero123plus",
+            custom_pipeline=custom_pipeline_arg,
             torch_dtype=torch_dtype,
         )
         pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
