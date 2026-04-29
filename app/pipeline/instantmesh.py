@@ -62,6 +62,80 @@ WEIGHT_FILES = {
 UNET_FILE = "diffusion_pytorch_model.bin"
 
 
+def _shim_transformers_pytorch_utils() -> None:
+    """Re-add helpers that newer transformers (5.x) removed.
+
+    InstantMesh's vendored DiNo encoder
+    (``src/models/encoder/dino.py``) does:
+
+        from transformers.pytorch_utils import (
+            find_pruneable_heads_and_indices,
+            prune_linear_layer,
+        )
+
+    Those helpers were public-but-internal in transformers <=4.x and
+    were removed/relocated in 5.x as part of a ``pytorch_utils``
+    cleanup. Modern Colab installs transformers 5.x by default, so the
+    import blows up at the very first ``instantiate_from_config`` call
+    on the reconstruction model.
+
+    Reimplementing them locally and injecting them into
+    ``transformers.pytorch_utils`` avoids forcing a transformers
+    downgrade (which is slow and risks knock-on dependency conflicts
+    with diffusers / accelerate / huggingface-hub). The implementations
+    here are lifted verbatim from transformers v4.46.0 -- they're tiny,
+    pure-PyTorch helpers with no transformers-version-specific behavior.
+    """
+    try:
+        import transformers.pytorch_utils as tpu  # type: ignore
+    except Exception:
+        # transformers itself isn't installed yet; nothing to shim. Whoever
+        # called us is about to fail at the next import anyway.
+        return
+
+    from torch import nn
+
+    if not hasattr(tpu, "find_pruneable_heads_and_indices"):
+        def find_pruneable_heads_and_indices(  # type: ignore[misc]
+            heads, n_heads, head_size, already_pruned_heads
+        ):
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for head in heads:
+                head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+                mask[head] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            index = torch.arange(len(mask))[mask].long()
+            return heads, index
+
+        tpu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+
+    if not hasattr(tpu, "prune_linear_layer"):
+        def prune_linear_layer(layer: "nn.Linear", index, dim: int = 0) -> "nn.Linear":  # type: ignore[misc]
+            index = index.to(layer.weight.device)
+            W = layer.weight.index_select(dim, index).clone().detach()
+            if layer.bias is not None:
+                if dim == 1:
+                    b = layer.bias.clone().detach()
+                else:
+                    b = layer.bias[index].clone().detach()
+            new_size = list(layer.weight.size())
+            new_size[dim] = len(index)
+            new_layer = nn.Linear(
+                new_size[1], new_size[0], bias=layer.bias is not None
+            ).to(layer.weight.device)
+            new_layer.weight.requires_grad = False
+            new_layer.weight.copy_(W.contiguous())
+            new_layer.weight.requires_grad = True
+            if layer.bias is not None:
+                new_layer.bias.requires_grad = False
+                new_layer.bias.copy_(b.contiguous())
+                new_layer.bias.requires_grad = True
+            return new_layer
+
+        tpu.prune_linear_layer = prune_linear_layer
+
+
 def _check_setup() -> Tuple[bool, str]:
     """Cheap pre-flight check. Returns (ok, message)."""
     if not USE_INSTANTMESH:
@@ -159,6 +233,13 @@ class CoarseGenerator:
         # Make `import src.utils...` (the way InstantMesh code is laid out) work.
         if str(INSTANTMESH_CODE_DIR) not in sys.path:
             sys.path.insert(0, str(INSTANTMESH_CODE_DIR))
+
+        # Backfill helpers that newer transformers removed before any
+        # InstantMesh code path imports them. Must run BEFORE we touch
+        # `src.models.lrm_mesh` (loaded indirectly via instantiate_from_config
+        # below) which transitively imports
+        # `transformers.pytorch_utils.find_pruneable_heads_and_indices`.
+        _shim_transformers_pytorch_utils()
 
         # All third-party imports live INSIDE this method so that a missing
         # optional dep (e.g. nvdiffrast on a non-CUDA box) raises here and is
