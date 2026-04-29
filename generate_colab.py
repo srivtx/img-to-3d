@@ -59,6 +59,8 @@ Python packages (including InstantMesh's pinned ``diffusers``,
 INSTALL_PY = """\
 import os
 import shutil
+import subprocess
+import time
 import importlib.util
 
 # IMPORTANT: don't delete the directory we're standing in. Re-running this
@@ -70,8 +72,38 @@ os.chdir("/content")
 if os.path.exists("/content/img-to-3d"):
     shutil.rmtree("/content/img-to-3d")
 
+
+def git_clone_with_retry(url, dest, *, attempts=5, depth=1):
+    \"\"\"
+    Robust git clone. Colab/GitHub occasionally drops connections mid-clone
+    with "Failed to connect to github.com port 443 after 136003 ms" -- without
+    a retry loop the rest of the cell silently runs without the cloned code.
+    \"\"\"
+    if os.path.exists(dest) and os.listdir(dest):
+        print(f"[clone] {dest} already exists, skipping")
+        return
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        cmd = ["git", "clone", "--depth", str(depth), url, dest]
+        print(f"[clone] attempt {attempt}/{attempts}: {' '.join(cmd)}")
+        proc = subprocess.run(cmd)
+        if proc.returncode == 0:
+            print(f"[clone] OK -> {dest}")
+            return
+        last_err = f"git exit {proc.returncode}"
+        wait = min(30, 5 * attempt)
+        print(f"[clone] failed ({last_err}); retrying in {wait}s ...")
+        if os.path.exists(dest):
+            shutil.rmtree(dest)
+        time.sleep(wait)
+    raise RuntimeError(f"Could not clone {url} after {attempts} attempts: {last_err}")
+
+
 # 1. Application code
-!git clone https://github.com/srivtx/img-to-3d.git
+git_clone_with_retry("https://github.com/srivtx/img-to-3d.git", "/content/img-to-3d")
 %cd /content/img-to-3d
 
 # 2. Base Python deps for the FastAPI app
@@ -81,9 +113,15 @@ if os.path.exists("/content/img-to-3d"):
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
 !chmod +x cloudflared
 
-# 4. InstantMesh source code (we use src/utils/* and src/models/* directly)
-!mkdir -p models
-!cd models && git clone https://github.com/TencentARC/InstantMesh.git
+# 4. InstantMesh source code (we use src/utils/* and src/models/* directly).
+#    Use the same retry helper so a transient github.com timeout doesn't
+#    leave us with an empty models/InstantMesh dir and a server that runs
+#    in MOCK mode forever.
+os.makedirs("models", exist_ok=True)
+git_clone_with_retry(
+    "https://github.com/TencentARC/InstantMesh.git",
+    "/content/img-to-3d/models/InstantMesh",
+)
 
 # 5. InstantMesh runtime deps -- TARGETED list.
 #
@@ -130,25 +168,41 @@ print(">>> Building nvdiffrast from source. This compiles ~20 CUDA files with")
 print(">>> nvcc and is silent for 3-5 minutes. Please wait, do NOT interrupt.")
 !pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast/"
 
-# 7. Smoke-test imports right now so we surface failures here, not later.
+# 7. Smoke-test EVERYTHING right now so we surface failures here, not later.
 print()
-print("Verifying imports...")
-required = [
+print("Verifying install...")
+
+required_modules = [
     "torch", "diffusers", "transformers", "rembg",
     "omegaconf", "einops", "pytorch_lightning",
     "nvdiffrast", "xatlas", "imageio", "cv2",
 ]
-missing = [m for m in required if importlib.util.find_spec(m) is None]
-if missing:
+missing_modules = [m for m in required_modules if importlib.util.find_spec(m) is None]
+
+required_paths = [
+    "/content/img-to-3d/app/main.py",
+    "/content/img-to-3d/models/InstantMesh/src",
+    "/content/img-to-3d/models/InstantMesh/configs/instant-mesh-large.yaml",
+]
+missing_paths = [p for p in required_paths if not os.path.exists(p)]
+
+if missing_modules or missing_paths:
     print()
-    print("WARNING: these modules are STILL missing after install:")
-    for m in missing:
-        print("  -", m)
+    print("WARNING: install is INCOMPLETE.")
+    if missing_modules:
+        print("  Missing Python modules:")
+        for m in missing_modules:
+            print("    -", m)
+    if missing_paths:
+        print("  Missing files / repos:")
+        for p in missing_paths:
+            print("    -", p)
     print()
-    print("Scroll up in this cell's output to find which pip line failed,")
-    print("re-run that line manually, then re-run the pre-flight cell.")
+    print("Scroll up in this cell's output to find the failing line")
+    print("(common: a `git clone` timeout or a `pip install` build error),")
+    print("then re-run THIS cell. The retry-clone helper makes that safe.")
 else:
-    print("All required modules import OK.")
+    print("All required modules and source paths OK.")
 """
 
 WEIGHTS_MD = """\
