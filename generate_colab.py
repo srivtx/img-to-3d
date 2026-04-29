@@ -59,6 +59,7 @@ Python packages (including InstantMesh's pinned ``diffusers``,
 INSTALL_PY = """\
 import os
 import shutil
+import importlib.util
 
 # IMPORTANT: don't delete the directory we're standing in. Re-running this
 # cell after a previous run leaves CWD = /content/img-to-3d, and rmtree on
@@ -74,26 +75,64 @@ if os.path.exists("/content/img-to-3d"):
 %cd /content/img-to-3d
 
 # 2. Base Python deps for the FastAPI app
-!pip install -q -r requirements.txt
-!pip install -q huggingface-hub
+!pip install -r requirements.txt
 
 # 3. cloudflared (public tunnel)
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
 !chmod +x cloudflared
 
-# 4. InstantMesh source code
+# 4. InstantMesh source code (we use src/utils/* and src/models/* directly)
 !mkdir -p models
 !cd models && git clone https://github.com/TencentARC/InstantMesh.git
 
-# 5. InstantMesh's pinned deps (this is what fixes the "No module named ..."
-#    chain we keep hitting -- pytorch_lightning, omegaconf, einops, rembg,
-#    diffusers==0.20.2, transformers==4.34.1, etc.)
-!pip install -q -r models/InstantMesh/requirements.txt
+# 5. InstantMesh runtime deps -- TARGETED list.
+#
+#    We deliberately do NOT use `pip install -r models/InstantMesh/requirements.txt`.
+#    That file pins old versions (gradio==3.41.2, bitsandbytes, xformers==0.0.22.post7,
+#    deepspeed, diffusers==0.19.3, transformers==4.34.1, torch==2.1.0) that don't
+#    have wheels for the Python 3.12 / torch 2.5+ that current Colab ships, and pip
+#    silently keeps going past the failures, leaving you with rembg / pytorch_lightning /
+#    nvdiffrast / xatlas missing -- which is exactly the failure mode reported.
+#
+#    Instead we install only the packages our code path actually imports, with
+#    ranges that pip can resolve against whatever torch Colab provides.
+!pip install \\
+    "pytorch-lightning>=2.0" \\
+    "omegaconf" \\
+    "einops" \\
+    "rembg" \\
+    "xatlas" \\
+    "plyfile" \\
+    "PyMCubes" \\
+    "opencv-python" \\
+    "imageio" \\
+    "diffusers>=0.27,<1.0" \\
+    "transformers>=4.36"
 
-# 6. nvdiffrast: needs a C++/CUDA build, not on PyPI
-!pip install -q git+https://github.com/NVlabs/nvdiffrast/
+# 6. nvdiffrast: builds CUDA kernels from source. Takes 3-5 min the first time.
+#    This is the ONLY hard CUDA-toolkit-required dep -- failing here means
+#    the server will run in MOCK mode.
+!pip install "git+https://github.com/NVlabs/nvdiffrast/"
 
-print("Install complete")
+# 7. Smoke-test imports right now so we surface failures here, not later.
+print()
+print("Verifying imports...")
+required = [
+    "torch", "diffusers", "transformers", "rembg",
+    "omegaconf", "einops", "pytorch_lightning",
+    "nvdiffrast", "xatlas", "imageio", "cv2",
+]
+missing = [m for m in required if importlib.util.find_spec(m) is None]
+if missing:
+    print()
+    print("WARNING: these modules are STILL missing after install:")
+    for m in missing:
+        print("  -", m)
+    print()
+    print("Scroll up in this cell's output to find which pip line failed,")
+    print("re-run that line manually, then re-run the pre-flight cell.")
+else:
+    print("All required modules import OK.")
 """
 
 WEIGHTS_MD = """\
