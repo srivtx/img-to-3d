@@ -62,3 +62,9 @@ htmlcov/
 
 # Node (if any)
 node_modules/
+
+# Documentation (local only)
+docs/
+docs2/
+learn.md
+problem_and_sol.md
