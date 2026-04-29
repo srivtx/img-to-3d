@@ -1,3 +1,4 @@
+# --- Base dependencies (always required) ---
 torch>=2.0.0
 torchvision
 fastapi>=0.104.0
@@ -8,16 +9,33 @@ pillow>=10.0.0
 trimesh>=4.0.0
 numpy>=1.24.0
 scipy>=1.10.0
+huggingface-hub>=0.20.0
 
-# --- InstantMesh dependencies (install after cloning repo) ---
-# diffusers>=0.24.0
-# transformers>=4.35.0
-# accelerate>=0.25.0
-# safetensors>=0.4.0
+# --- InstantMesh integration ---
+# When USE_INSTANTMESH=true, app/pipeline/instantmesh.py imports the modules
+# below. Most of them come from InstantMesh's own requirements.txt (which
+# pins very specific versions of diffusers/transformers/pytorch-lightning).
+# The recommended setup is:
+#
+#   git clone https://github.com/TencentARC/InstantMesh.git models/InstantMesh
+#   pip install -r models/InstantMesh/requirements.txt
+#
+# That installs everything below in the exact versions InstantMesh expects.
+# If you prefer to install them here directly, uncomment:
+#
+# pytorch-lightning==2.1.2
+# diffusers==0.20.2
+# transformers==4.34.1
+# accelerate
 # omegaconf
 # einops
 # rembg
-# huggingface-hub
+# imageio[ffmpeg]
+# xatlas
+# plyfile
+# PyMCubes
+# # nvdiffrast requires CUDA toolkit; install only on GPU machines:
+# # pip install git+https://github.com/NVlabs/nvdiffrast/
 
-# Optional: better mesh processing
+# --- Optional: better mesh refinement ---
 # pymeshlab

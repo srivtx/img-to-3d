@@ -14,9 +14,6 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Hugging Face hub for model downloads
-RUN pip install --no-cache-dir huggingface-hub
-
 # Copy application code
 COPY app/ ./app/
 COPY frontend/ ./frontend/
@@ -24,10 +21,23 @@ COPY frontend/ ./frontend/
 # Create directories
 RUN mkdir -p models outputs
 
-# Pre-download InstantMesh weights during build (optional - uncomment after testing)
-# This makes the image ~4GB but speeds up first inference
-# RUN python -c "from huggingface_hub import snapshot_download; \
-#     snapshot_download('TencentARC/InstantMesh', local_dir='/app/models/instantmesh', local_files_only=False)"
+# ----- Optional: enable real InstantMesh inference -----
+# Default HF Space tier is CPU-only and InstantMesh requires CUDA + nvdiffrast,
+# so we ship the image with USE_INSTANTMESH off (mock icosphere). To enable
+# real inference on a GPU-enabled Space:
+#
+# 1. Switch the Space hardware to a GPU tier.
+# 2. Uncomment the block below to clone the InstantMesh repo, install its
+#    pinned deps, and pre-download weights into the image.
+# 3. Set USE_INSTANTMESH=true and DEVICE=cuda below.
+#
+# RUN git clone https://github.com/TencentARC/InstantMesh.git /app/models/InstantMesh \
+#  && pip install --no-cache-dir -r /app/models/InstantMesh/requirements.txt \
+#  && pip install --no-cache-dir git+https://github.com/NVlabs/nvdiffrast/ \
+#  && python -c "from huggingface_hub import snapshot_download; \
+#       snapshot_download('TencentARC/InstantMesh', \
+#         local_dir='/app/models/instantmesh', \
+#         local_dir_use_symlinks=False)"
 
 # Expose port (Hugging Face Spaces uses 7860)
 EXPOSE 7860
@@ -36,6 +46,7 @@ EXPOSE 7860
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV DEVICE=cpu
+ENV USE_INSTANTMESH=false
 ENV KEEP_MODELS_IN_MEMORY=true
 ENV MAX_CONCURRENT_JOBS=1
 

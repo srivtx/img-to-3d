@@ -1,149 +1,278 @@
+"""Generate the Colab notebook from Python.
+
+Always edit THIS file. Never edit the .ipynb JSON by hand — that's how the
+escape-sequence corruption from previous handoffs happened. Run
+``python generate_colab.py`` after every change to refresh
+``colab/Image_to_3D_Generator.ipynb``.
+"""
+
 import nbformat
 from nbformat.v4 import new_notebook, new_markdown_cell, new_code_cell
 
-nb = new_notebook()
 
-cell1 = new_markdown_cell("""
+# ---------------------------------------------------------------------------
+# Cell sources
+# ---------------------------------------------------------------------------
+
+INTRO_MD = """\
 # Image-to-3D Generator on Colab (Free T4 GPU)
 
 **What this does:**
 1. Clones the repo
-2. Installs everything
-3. Downloads InstantMesh AI weights (~4GB)
-4. Starts the server
-5. Gives you a public URL
+2. Installs everything (including InstantMesh's pinned deps)
+3. Downloads InstantMesh AI weights (~4 GB)
+4. Runs a pre-flight diagnostic so you know REAL vs MOCK mode before generating
+5. Starts the server and a public tunnel
 
 **Runtime:** ~5-8 minutes first time (downloads weights)
-**GPU:** Free T4 (16GB VRAM)
+**GPU:** Free T4 (16 GB VRAM)
 
 ---
 
 ## Step 1: Check GPU
 
 Make sure you have a GPU assigned. If not: Runtime → Change runtime type → GPU
-""")
+"""
 
-cell2 = new_code_cell("""!nvidia-smi
+CHECK_GPU_PY = """\
+!nvidia-smi
 import torch
 print(f"PyTorch: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-""")
+"""
 
-cell3 = new_markdown_cell("""
-## Step 2: Clone Repo, Code, and Install
+INSTALL_MD = """\
+## Step 2: Clone repo + InstantMesh + install everything
 
-This downloads the application code, clones InstantMesh, and installs Python packages.
-""")
+This downloads the application code, clones InstantMesh, and installs all
+Python packages (including InstantMesh's pinned ``diffusers``,
+``transformers``, ``pytorch-lightning`` etc, and the CUDA-dependent
+``nvdiffrast``).
+"""
 
-cell4 = new_code_cell("""# Remove existing directory if it exists (from previous run)
-import shutil
+# Note: this cell fixes the long-standing "shell-init: getcwd" bug. If the
+# user re-runs this cell after a previous run, the shell's CWD is still
+# /content/img-to-3d. Calling shutil.rmtree on it from there leaves the
+# shell in a deleted directory and every subsequent ``!command`` fails.
+# We chdir to /content FIRST.
+INSTALL_PY = """\
 import os
+import shutil
+
+# IMPORTANT: don't delete the directory we're standing in. Re-running this
+# cell after a previous run leaves CWD = /content/img-to-3d, and rmtree on
+# that puts the shell in a "ghost" directory where every shell command
+# (including the very next !git) fails with "shell-init: getcwd".
+os.chdir("/content")
+
 if os.path.exists("/content/img-to-3d"):
     shutil.rmtree("/content/img-to-3d")
 
-# Clone the main repo
+# 1. Application code
 !git clone https://github.com/srivtx/img-to-3d.git
-%cd img-to-3d
+%cd /content/img-to-3d
 
-# Install dependencies
+# 2. Base Python deps for the FastAPI app
 !pip install -q -r requirements.txt
-
-# Install Hugging Face hub for weight downloads
 !pip install -q huggingface-hub
 
-# Install cloudflared for tunnel (public URL)
+# 3. cloudflared (public tunnel)
 !wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
 !chmod +x cloudflared
 
-# Clone InstantMesh code (needed for real inference)
+# 4. InstantMesh source code
 !mkdir -p models
 !cd models && git clone https://github.com/TencentARC/InstantMesh.git
 
-print("Setup complete")
-""")
+# 5. InstantMesh's pinned deps (this is what fixes the "No module named ..."
+#    chain we keep hitting -- pytorch_lightning, omegaconf, einops, rembg,
+#    diffusers==0.20.2, transformers==4.34.1, etc.)
+!pip install -q -r models/InstantMesh/requirements.txt
 
-cell5 = new_markdown_cell("""
-## Step 3: Download InstantMesh Weights
+# 6. nvdiffrast: needs a C++/CUDA build, not on PyPI
+!pip install -q git+https://github.com/NVlabs/nvdiffrast/
 
-Downloads the AI model (~4GB). This is the brain that turns your photos into 3D.
+print("Install complete")
+"""
 
-*Only needs to run once per session.*
-""")
+WEIGHTS_MD = """\
+## Step 3: Download InstantMesh weights
 
-cell6 = new_code_cell("""import os
+Downloads the AI model (~4 GB) — the brain that turns your photos into 3D.
+
+*Only needs to run once per session. If you re-run the install cell above,
+re-run this one too.*
+"""
+
+WEIGHTS_PY = """\
+import os
 from huggingface_hub import snapshot_download
 
 weights_dir = "/content/img-to-3d/models/instantmesh"
 os.makedirs(weights_dir, exist_ok=True)
 
-print("Downloading InstantMesh weights... This takes 3-5 minutes")
-print("(~4GB total)")
+print("Downloading InstantMesh weights from TencentARC/InstantMesh ...")
+print("(~4 GB, takes 3-5 minutes the first time)")
 
 snapshot_download(
     repo_id="TencentARC/InstantMesh",
     local_dir=weights_dir,
-    local_dir_use_symlinks=False
+    local_dir_use_symlinks=False,
 )
 
-print(f"Weights downloaded to: {weights_dir}")
-print(f"Files: {len(os.listdir(weights_dir))}")
-""")
+print()
+print(f"Weights at: {weights_dir}")
+for f in sorted(os.listdir(weights_dir)):
+    p = os.path.join(weights_dir, f)
+    size_mb = os.path.getsize(p) / (1024 * 1024)
+    print(f"  {f:50s} {size_mb:8.1f} MB")
+"""
 
-cell7 = new_markdown_cell("""
-## Step 4: Start the Server
+PREFLIGHT_MD = """\
+## Step 4: Pre-flight check
 
-Starts the FastAPI server with real 3D generation enabled.
+Before we boot the server, verify every piece InstantMesh needs is in place.
+If anything is missing the server would silently fall back to MOCK mode
+(icosphere) — this cell prints the exact reason BEFORE you waste time
+generating.
+"""
 
-**Wait for the tunnel URL to appear below (takes ~30 seconds).**
-""")
+PREFLIGHT_PY = """\
+import os
+import importlib.util
 
-cell8 = new_code_cell("""import subprocess
-import time
-import threading
+problems = []
+
+# 1. InstantMesh source layout
+imesh_root = "/content/img-to-3d/models/InstantMesh"
+for sub in ["src", "src/utils", "configs"]:
+    if not os.path.exists(os.path.join(imesh_root, sub)):
+        problems.append(f"InstantMesh missing: {sub}")
+if not os.path.exists(os.path.join(imesh_root, "configs/instant-mesh-large.yaml")):
+    problems.append("InstantMesh config missing: configs/instant-mesh-large.yaml")
+
+# 2. Weight files
+weights_dir = "/content/img-to-3d/models/instantmesh"
+required_weights = ["diffusion_pytorch_model.bin", "instant_mesh_large.ckpt"]
+for f in required_weights:
+    p = os.path.join(weights_dir, f)
+    if not os.path.exists(p):
+        problems.append(f"Weight missing: {f}")
+    elif os.path.getsize(p) < 100 * 1024 * 1024:  # < 100 MB = clearly truncated
+        problems.append(f"Weight looks truncated: {f} ({os.path.getsize(p)} bytes)")
+
+# 3. Critical Python deps (the ones that have failed for us in the past)
+required_modules = [
+    "torch", "diffusers", "transformers", "rembg",
+    "omegaconf", "einops", "pytorch_lightning",
+    "nvdiffrast", "xatlas", "imageio",
+]
+for mod in required_modules:
+    if importlib.util.find_spec(mod) is None:
+        problems.append(f"Python module missing: {mod}")
+
+if problems:
+    print("PRE-FLIGHT FAILED:")
+    for p in problems:
+        print(" -", p)
+    print()
+    print("The server will run in MOCK mode (icosphere) until these are fixed.")
+    print("Re-run the install cell, then re-run this cell.")
+else:
+    print("PRE-FLIGHT PASSED")
+    print("Real InstantMesh inference should work end-to-end.")
+"""
+
+SERVER_MD = """\
+## Step 5: Start the server + public tunnel
+
+Boots the FastAPI server (with ``USE_INSTANTMESH=true``) and opens a
+cloudflared tunnel. Wait for the ``https://...trycloudflare.com`` URL.
+
+The first generation per session takes ~30 s extra while the model warms up
+on the GPU. Subsequent generations are ~5-10 s.
+"""
+
+# We escape backslashes carefully so the GENERATED Python source contains
+# exactly: re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+SERVER_PY = """\
+import os
 import re
+import socket
+import subprocess
+import sys
+import threading
+import time
 
-# Environment variables for the server
 env = os.environ.copy()
 env["DEVICE"] = "cuda"
 env["USE_INSTANTMESH"] = "true"
 env["FP16"] = "true"
 env["KEEP_MODELS_IN_MEMORY"] = "true"
+env["INSTANTMESH_CONFIG"] = "instant-mesh-large"
 
-# Start the FastAPI server in background
-print("Starting server on port 8000...")
+server_log_path = "/content/server.log"
+server_log_file = open(server_log_path, "w", buffering=1)
+
+print(f"Starting FastAPI server on :8000 (logs -> {server_log_path}) ...")
 server_proc = subprocess.Popen(
-    ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"],
+    [sys.executable, "-m", "uvicorn", "app.main:app",
+     "--host", "0.0.0.0", "--port", "8000"],
     cwd="/content/img-to-3d",
     env=env,
-    stdout=subprocess.PIPE,
+    stdout=server_log_file,
     stderr=subprocess.STDOUT,
-    text=True
+    text=True,
 )
 
-# Give server time to start
-time.sleep(5)
 
-# Start cloudflared tunnel
-print("Starting public tunnel...")
+def wait_for_port(port, host="127.0.0.1", timeout=240):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if server_proc.poll() is not None:
+            return False, f"server exited with code {server_proc.returncode}"
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True, "ok"
+        except OSError:
+            time.sleep(1)
+    return False, f"port {port} did not open within {timeout}s"
+
+
+print("Waiting for server (this is where the 4 GB of weights load into VRAM)...")
+ok, msg = wait_for_port(8000, timeout=300)
+if not ok:
+    print(f"Server FAILED to come up: {msg}")
+    print()
+    print("--- last 4 KB of server log ---")
+    with open(server_log_path) as f:
+        print(f.read()[-4000:])
+    raise SystemExit(1)
+print("Server is listening on :8000")
+
+# --- cloudflared tunnel ---------------------------------------------------
+print("Starting cloudflared tunnel...")
 tunnel_proc = subprocess.Popen(
-    ["./cloudflared", "tunnel", "--url", "http://localhost:8000"],
+    ["./cloudflared", "tunnel", "--no-autoupdate", "--url", "http://localhost:8000"],
     cwd="/content/img-to-3d",
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
-    text=True
+    text=True,
 )
 
 public_url = None
+url_re = re.compile(r"https://[a-z0-9-]+\\.trycloudflare\\.com")
+
 
 def read_tunnel_output():
     global public_url
     for line in iter(tunnel_proc.stdout.readline, ""):
         if not line:
             break
-        match = re.search(r"https://[a-z0-9-]+\\.trycloudflare\\.com", line)
-        if match and not public_url:
-            public_url = match.group(0)
+        m = url_re.search(line)
+        if m and not public_url:
+            public_url = m.group(0)
             print()
             print("=" * 60)
             print("YOUR APP IS LIVE!")
@@ -151,95 +280,115 @@ def read_tunnel_output():
             print()
             print(f"Public URL: {public_url}")
             print()
-            print("Click or copy this URL to your browser")
-            print()
-            print("Upload a photo and see 3D generation!")
+            print("Open it in your browser, drop a photo, watch a real 3D")
+            print("mesh appear. Keep THIS cell running -- stopping it stops")
+            print("both the server and the tunnel.")
             print("=" * 60)
             print()
 
-# Read tunnel output in background thread
-tunnel_thread = threading.Thread(target=read_tunnel_output, daemon=True)
-tunnel_thread.start()
 
-# Wait for URL to appear
-for i in range(30):
+threading.Thread(target=read_tunnel_output, daemon=True).start()
+
+for _ in range(60):
     if public_url:
         break
     time.sleep(1)
 
 if not public_url:
-    print("Tunnel URL not found yet. Check output above.")
+    print("Tunnel URL not detected after 60s -- check cloudflared output above.")
 
 print()
-print("Server is running. Keep this cell alive!")
-print("(Stopping this cell will stop the server)")
-""")
+print("Server PID:", server_proc.pid)
+print("Tail server log with:  !tail -n 200 /content/server.log")
+"""
 
-cell9 = new_markdown_cell("""
+DONE_MD = """\
 ## Done!
 
-Your app is running at the URL shown above.
+Your app is running at the URL printed above.
 
 **Important:**
 - Keep this Colab tab open
 - The tunnel URL is temporary
-- First generation is slower (model loads into GPU)
+- First generation per session is slower (model warmup)
 
 **Performance on T4:**
-- Preview (coarse): ~5-10 seconds
-- Final (refined): ~10-20 seconds
+- Preview (coarse): ~5-10 seconds (after warmup)
+- Final (refined): ~10-20 seconds total
 
 ---
 
 ## Troubleshooting
 
-**"No GPU found"** → Runtime → Change runtime type → GPU
+**"PRE-FLIGHT FAILED"** → Re-run the install + weights cells, then this cell.
 
-**"CUDA out of memory"** → Restart runtime and run cells again
+**"Still seeing a mock sphere"** → Run the debug cell below; the server log
+will show whether it loaded REAL or MOCK mode at startup.
 
-**"URL not opening"** → Wait 30 seconds and try again, or check if URL starts with `https://`
+**"CUDA out of memory"** → Restart runtime (Runtime → Disconnect and delete
+runtime) and run all cells again.
 
-**"Still showing mock sphere"** → Check the debug cell below to see server logs
-""")
+**"URL not opening"** → Wait 30 s and retry. If it still fails, the tunnel
+may have been throttled — re-run the server cell to get a new URL.
+"""
 
-cell10 = new_code_cell("""# Debug: Show recent server output
-print("Recent server output:")
-print("-" * 50)
+DEBUG_PY = """\
+print("--- last 200 lines of /content/server.log ---")
+try:
+    with open("/content/server.log") as f:
+        lines = f.readlines()
+    print("".join(lines[-200:]))
+except FileNotFoundError:
+    print("(server log not created yet -- the server cell hasn't run)")
 
-import select
-if server_proc and server_proc.poll() is None:
-    ready, _, _ = select.select([server_proc.stdout], [], [], 0.5)
-    if ready:
-        for _ in range(20):
-            line = server_proc.stdout.readline()
-            if not line:
-                break
-            print(line.strip())
-else:
-    print("Server process status:", server_proc.poll() if server_proc else "None")
-""")
+print()
+print("--- /health ---")
+import urllib.request, json
+try:
+    with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5) as r:
+        print(json.dumps(json.loads(r.read()), indent=2))
+except Exception as e:
+    print("health check failed:", e)
+"""
 
-nb.cells = [cell1, cell2, cell3, cell4, cell5, cell6, cell7, cell8, cell9, cell10]
 
-nb.metadata = {
-    "colab": {
-        "provenance": [],
-        "gpuType": "T4"
-    },
-    "kernelspec": {
-        "name": "python3",
-        "display_name": "Python 3"
-    },
-    "language_info": {
-        "name": "python"
-    },
-    "accelerator": "GPU"
-}
+# ---------------------------------------------------------------------------
+# Notebook assembly
+# ---------------------------------------------------------------------------
 
-nbformat.validate(nb)
+def main():
+    nb = new_notebook()
+    nb.cells = [
+        new_markdown_cell(INTRO_MD),
+        new_code_cell(CHECK_GPU_PY),
+        new_markdown_cell(INSTALL_MD),
+        new_code_cell(INSTALL_PY),
+        new_markdown_cell(WEIGHTS_MD),
+        new_code_cell(WEIGHTS_PY),
+        new_markdown_cell(PREFLIGHT_MD),
+        new_code_cell(PREFLIGHT_PY),
+        new_markdown_cell(SERVER_MD),
+        new_code_cell(SERVER_PY),
+        new_markdown_cell(DONE_MD),
+        new_code_cell(DEBUG_PY),
+    ]
 
-with open("colab/Image_to_3D_Generator.ipynb", "w") as f:
-    nbformat.write(nb, f)
+    nb.metadata = {
+        "colab": {"provenance": [], "gpuType": "T4"},
+        "kernelspec": {"name": "python3", "display_name": "Python 3"},
+        "language_info": {"name": "python"},
+        "accelerator": "GPU",
+    }
 
-print("Notebook created successfully!")
-print("JSON valid!")
+    nbformat.validate(nb)
+
+    out_path = "colab/Image_to_3D_Generator.ipynb"
+    with open(out_path, "w") as f:
+        nbformat.write(nb, f)
+
+    print(f"Wrote {out_path}")
+    print("JSON valid")
+
+
+if __name__ == "__main__":
+    main()

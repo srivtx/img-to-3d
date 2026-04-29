@@ -30,9 +30,11 @@ async def cleanup_worker():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown events."""
-    # Preload models if configured
+    # Preload models if configured. We dispatch to a thread so a slow load
+    # (downloading weights, loading 4GB of ckpts onto GPU) doesn't block the
+    # event loop and starve the /health endpoint during boot.
     if KEEP_MODELS_IN_MEMORY:
-        coarse_generator.load()
+        await asyncio.to_thread(coarse_generator.load)
     
     # Start cleanup worker
     task = asyncio.create_task(cleanup_worker())
@@ -70,7 +72,13 @@ async def root():
 
 
 async def process_job(job_id: str, image_path: str):
-    """Background task: coarse generation → refinement."""
+    """Background task: coarse generation → refinement.
+
+    The heavy GPU/CPU work is dispatched to a thread via ``asyncio.to_thread``
+    so it does not block the asyncio event loop (which would otherwise stall
+    job-status polling and other API requests for the entire duration of a
+    generation).
+    """
     try:
         # --- Phase 1: Coarse generation ---
         await queue.update_job(
@@ -83,8 +91,9 @@ async def process_job(job_id: str, image_path: str):
         output_dir = os.path.join(str(OUTPUTS_DIR), job_id)
         os.makedirs(output_dir, exist_ok=True)
         
-        preview_path, _ = coarse_generator.generate(image_path, output_dir)
-        preview_url = f"/outputs/{job_id}/preview.glb"
+        preview_path, _ = await asyncio.to_thread(
+            coarse_generator.generate, image_path, output_dir
+        )
         
         await queue.update_job(
             job_id,
@@ -102,8 +111,9 @@ async def process_job(job_id: str, image_path: str):
             message="Refining mesh and textures...",
         )
         
-        final_path = refinement_pipeline.refine(preview_path, output_dir)
-        final_url = f"/outputs/{job_id}/final.glb"
+        final_path = await asyncio.to_thread(
+            refinement_pipeline.refine, preview_path, output_dir
+        )
         
         await queue.update_job(
             job_id,

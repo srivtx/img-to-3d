@@ -1,247 +1,332 @@
-"""
-InstantMesh coarse generation wrapper.
+"""InstantMesh in-process coarse generator.
 
-This file handles loading and running the InstantMesh model for
-image-to-3D generation. It auto-detects whether InstantMesh is set up
-and falls back to mock mode (icosphere) if not.
+This module wraps TencentARC/InstantMesh as a singleton that loads the
+diffusion + reconstruction models once into the current Python process and
+reuses them for every request. If anything is missing (env flag off, repo
+not cloned, weights not downloaded, optional CUDA-only deps unavailable)
+it transparently falls back to a mock icosphere so the rest of the app
+keeps working.
+
+The integration follows the official `InstantMesh/app.py` reference
+(https://github.com/TencentARC/InstantMesh/blob/main/app.py) which is the
+canonical end-to-end pattern (image -> 6 zero123plus views -> triplane
+-> mesh -> GLB). We override the config's checkpoint paths to point at
+our own ``models/instantmesh/`` weights dir so we never trigger an
+unattended ``hf_hub_download`` at inference time.
 
 Environment variables:
-    USE_INSTANTMESH: "true" to enable real inference
-    DEVICE: "cuda", "mps", or "cpu"
+    USE_INSTANTMESH:               "true" to enable real inference
+    DEVICE:                        "cuda" / "mps" / "cpu" (real path is CUDA-only)
+    INSTANTMESH_CONFIG:            yaml stem in InstantMesh/configs/, default "instant-mesh-large"
+    INSTANTMESH_DIFFUSION_STEPS:   denoise steps (default 75)
+    INSTANTMESH_REMBG:             "true"/"false" - run rembg pre-processing (default "true")
+    INSTANTMESH_SEED:              int seed for reproducibility (default 42)
 """
+
+from __future__ import annotations
 
 import os
 import sys
-import subprocess
-import tempfile
+import threading
 import traceback
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from PIL import Image
 
 from app.core.config import DEVICE, FP16
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-USE_INSTANTMESH = os.getenv("USE_INSTANTMESH", "false").lower() == "true"
 
-# Path to InstantMesh code (relative to project root)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+USE_INSTANTMESH = os.getenv("USE_INSTANTMESH", "false").lower() == "true"
+DIFFUSION_STEPS = int(os.getenv("INSTANTMESH_DIFFUSION_STEPS", "75"))
+DEFAULT_CONFIG = os.getenv("INSTANTMESH_CONFIG", "instant-mesh-large")
+DO_REMBG = os.getenv("INSTANTMESH_REMBG", "true").lower() == "true"
+SEED = int(os.getenv("INSTANTMESH_SEED", "42"))
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 INSTANTMESH_CODE_DIR = PROJECT_ROOT / "models" / "InstantMesh"
 INSTANTMESH_WEIGHTS_DIR = PROJECT_ROOT / "models" / "instantmesh"
 
+# Mapping from config name -> reconstruction checkpoint filename in the HF repo
+WEIGHT_FILES = {
+    "instant-mesh-base": "instant_mesh_base.ckpt",
+    "instant-mesh-large": "instant_mesh_large.ckpt",
+    "instant-nerf-base": "instant_nerf_base.ckpt",
+    "instant-nerf-large": "instant_nerf_large.ckpt",
+}
+UNET_FILE = "diffusion_pytorch_model.bin"
 
-def _check_instantmesh_setup() -> Tuple[bool, str]:
-    """Check if InstantMesh is properly set up."""
+
+def _check_setup() -> Tuple[bool, str]:
+    """Cheap pre-flight check. Returns (ok, message)."""
     if not USE_INSTANTMESH:
-        return False, "USE_INSTANTMESH env var is not set to 'true'"
-
+        return False, "USE_INSTANTMESH env var is not 'true'"
+    if DEFAULT_CONFIG not in WEIGHT_FILES:
+        return False, f"Unknown INSTANTMESH_CONFIG '{DEFAULT_CONFIG}' (valid: {list(WEIGHT_FILES)})"
     if not INSTANTMESH_CODE_DIR.exists():
-        return False, f"InstantMesh code not found at {INSTANTMESH_CODE_DIR}"
-
+        return False, f"InstantMesh repo not cloned at {INSTANTMESH_CODE_DIR}"
+    if not (INSTANTMESH_CODE_DIR / "src").exists():
+        return False, f"InstantMesh src/ missing in {INSTANTMESH_CODE_DIR}"
+    cfg_path = INSTANTMESH_CODE_DIR / "configs" / f"{DEFAULT_CONFIG}.yaml"
+    if not cfg_path.exists():
+        return False, f"Config file missing: {cfg_path}"
     if not INSTANTMESH_WEIGHTS_DIR.exists():
-        return False, f"Weights not found at {INSTANTMESH_WEIGHTS_DIR}"
+        return False, f"Weights dir missing: {INSTANTMESH_WEIGHTS_DIR}"
 
-    weight_files = list(INSTANTMESH_WEIGHTS_DIR.iterdir())
-    if len(weight_files) == 0:
-        return False, f"Weights directory is empty: {INSTANTMESH_WEIGHTS_DIR}"
-
-    return True, f"Found {len(weight_files)} weight files"
+    needed = [UNET_FILE, WEIGHT_FILES[DEFAULT_CONFIG]]
+    missing = [n for n in needed if not (INSTANTMESH_WEIGHTS_DIR / n).exists()]
+    if missing:
+        return False, f"Missing weight files in {INSTANTMESH_WEIGHTS_DIR}: {missing}"
+    return True, f"OK (config={DEFAULT_CONFIG}, weights at {INSTANTMESH_WEIGHTS_DIR})"
 
 
 class CoarseGenerator:
-    """Lazy-loaded singleton for coarse 3D generation."""
+    """Lazy, thread-safe singleton wrapping the InstantMesh pipeline."""
 
-    _instance = None
-    _loaded = False
-    _using_mock = False
-    _setup_ok = False
-    _setup_msg = ""
+    _instance: Optional["CoarseGenerator"] = None
+    _load_lock = threading.Lock()
+    _gpu_lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            cls._instance._loaded = False
+            cls._instance._using_mock = False
+            cls._instance._setup_ok = False
+            cls._instance._setup_msg = ""
         return cls._instance
 
-    def load(self):
-        """Load model weights into memory."""
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def load(self) -> None:
+        """Load model into VRAM; idempotent and thread-safe."""
         if self._loaded:
             return
+        with self._load_lock:
+            if self._loaded:
+                return
 
-        self._setup_ok, self._setup_msg = _check_instantmesh_setup()
+            self._setup_ok, self._setup_msg = _check_setup()
+            if not self._setup_ok:
+                print(f"[InstantMesh] MOCK mode: {self._setup_msg}")
+                self._using_mock = True
+                self._loaded = True
+                return
 
-        if not self._setup_ok:
-            print(f"[WARN] Running in MOCK mode. Reason: {self._setup_msg}")
-            self._using_mock = True
+            print(f"[InstantMesh] Setup: {self._setup_msg}")
+            print(f"[InstantMesh] Device={DEVICE} FP16={FP16} steps={DIFFUSION_STEPS} rembg={DO_REMBG}")
+
+            try:
+                self._load_real_model()
+                print("[InstantMesh] REAL model loaded successfully")
+            except Exception as e:  # broad: any import / IO / CUDA error -> mock
+                print(f"[InstantMesh] Real load FAILED -> falling back to MOCK: {e}")
+                traceback.print_exc()
+                self._using_mock = True
+
             self._loaded = True
-            return
-
-        print("[INFO] InstantMesh setup OK:", self._setup_msg)
-        print("[INFO] Loading InstantMesh coarse generator...")
-        print(f"[INFO] Device: {DEVICE}")
-        print(f"[INFO] Weights dir: {INSTANTMESH_WEIGHTS_DIR}")
-
-        # Check what files are in the weights dir
-        try:
-            weight_files = list(INSTANTMESH_WEIGHTS_DIR.iterdir())
-            print(f"[INFO] Weight files: {[f.name for f in weight_files[:5]]}")
-        except Exception as e:
-            print(f"[WARN] Could not list weights: {e}")
-
-        self._loaded = True
 
     def generate(
         self,
         image_path: str,
         output_dir: str,
         num_views: int = 6,
-        mesh_size: int = 384,
+        mesh_size: int = 384,  # noqa: ARG002 - kept for API stability
     ) -> Tuple[str, Optional[str]]:
-        """
-        Generate coarse mesh from image.
-
-        Returns:
-            (preview_glb_path, texture_path_or_none)
-        """
+        """Run end-to-end image-to-3D and return (preview_glb_path, texture_path|None)."""
         self.load()
-
-        if self._using_mock or not self._setup_ok:
+        if self._using_mock:
             return self._mock_generate(image_path, output_dir)
 
-        return self._real_generate(image_path, output_dir, num_views, mesh_size)
+        try:
+            with self._gpu_lock:
+                return self._real_generate(image_path, output_dir, num_views)
+        except Exception as e:
+            print(f"[InstantMesh] Real inference FAILED -> falling back to MOCK for this job: {e}")
+            traceback.print_exc()
+            return self._mock_generate(image_path, output_dir)
 
+    # ------------------------------------------------------------------
+    # Internals: model loading
+    # ------------------------------------------------------------------
+    def _load_real_model(self) -> None:
+        # Make `import src.utils...` (the way InstantMesh code is laid out) work.
+        if str(INSTANTMESH_CODE_DIR) not in sys.path:
+            sys.path.insert(0, str(INSTANTMESH_CODE_DIR))
+
+        # All third-party imports live INSIDE this method so that a missing
+        # optional dep (e.g. nvdiffrast on a non-CUDA box) raises here and is
+        # caught by the outer try/except in load(), not at module import time.
+        from omegaconf import OmegaConf
+        from diffusers import DiffusionPipeline, EulerAncestralDiscreteScheduler
+        import rembg
+
+        from src.utils.train_util import instantiate_from_config  # type: ignore
+
+        cfg_path = INSTANTMESH_CODE_DIR / "configs" / f"{DEFAULT_CONFIG}.yaml"
+        config = OmegaConf.load(str(cfg_path))
+
+        # Point the config at OUR weights dir so the `os.path.exists(...)`
+        # checks in InstantMesh code resolve locally instead of triggering
+        # an unattended HF download.
+        config.infer_config.unet_path = str(INSTANTMESH_WEIGHTS_DIR / UNET_FILE)
+        config.infer_config.model_path = str(
+            INSTANTMESH_WEIGHTS_DIR / WEIGHT_FILES[DEFAULT_CONFIG]
+        )
+
+        self.config = config
+        self.config_name = DEFAULT_CONFIG
+        self.is_flexicubes = DEFAULT_CONFIG.startswith("instant-mesh")
+
+        device = torch.device(DEVICE)
+        torch_dtype = torch.float16 if (FP16 and device.type == "cuda") else torch.float32
+
+        # ---- Diffusion pipeline (zero123plus + custom UNet) ----------
+        print(f"[InstantMesh] Loading zero123plus pipeline (dtype={torch_dtype})")
+        pipeline = DiffusionPipeline.from_pretrained(
+            "sudo-ai/zero123plus-v1.2",
+            custom_pipeline="zero123plus",
+            torch_dtype=torch_dtype,
+        )
+        pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+            pipeline.scheduler.config, timestep_spacing="trailing"
+        )
+
+        print(f"[InstantMesh] Loading custom UNet from {config.infer_config.unet_path}")
+        unet_state = torch.load(config.infer_config.unet_path, map_location="cpu")
+        pipeline.unet.load_state_dict(unet_state, strict=True)
+        del unet_state
+        pipeline = pipeline.to(device)
+
+        # ---- Reconstruction model -----------------------------------
+        print(f"[InstantMesh] Loading recon model from {config.infer_config.model_path}")
+        model = instantiate_from_config(config.model_config)
+        ckpt = torch.load(config.infer_config.model_path, map_location="cpu")
+        state = ckpt.get("state_dict", ckpt)
+        # Strip the `lrm_generator.` prefix used during training and drop
+        # `source_camera` keys that the inference model doesn't expose.
+        prefix = "lrm_generator."
+        state = {
+            k[len(prefix):]: v
+            for k, v in state.items()
+            if k.startswith(prefix) and "source_camera" not in k
+        }
+        model.load_state_dict(state, strict=True)
+        del ckpt, state
+
+        model = model.to(device)
+        if self.is_flexicubes:
+            model.init_flexicubes_geometry(device, fovy=30.0)
+        model = model.eval()
+
+        self.pipeline = pipeline
+        self.model = model
+        self.device = device
+        self.torch_dtype = torch_dtype
+        self.rembg_session = rembg.new_session() if DO_REMBG else None
+
+    # ------------------------------------------------------------------
+    # Internals: inference
+    # ------------------------------------------------------------------
     def _real_generate(
         self,
         image_path: str,
         output_dir: str,
-        num_views: int = 6,
-        mesh_size: int = 384,
+        num_views: int,
     ) -> Tuple[str, Optional[str]]:
-        """Run InstantMesh via subprocess call."""
+        from torchvision.transforms import v2
+        from einops import rearrange
+        from pytorch_lightning import seed_everything
+
+        from src.utils.camera_util import get_zero123plus_input_cameras  # type: ignore
+        from src.utils.mesh_util import save_glb  # type: ignore
+        from src.utils.infer_util import remove_background, resize_foreground  # type: ignore
+
+        os.makedirs(output_dir, exist_ok=True)
         preview_path = os.path.join(output_dir, "preview.glb")
 
-        # Strategy: Run InstantMesh's run.py or gradio_app.py via subprocess
-        # This is the most reliable way since their API may change
+        seed_everything(SEED)
 
-        run_script = INSTANTMESH_CODE_DIR / "run.py"
-        gradio_script = INSTANTMESH_CODE_DIR / "gradio_app.py"
+        # ----- Stage 1: input image -> 6-view tile (zero123plus) --------
+        input_image = Image.open(image_path)
+        if DO_REMBG:
+            input_image = remove_background(input_image, self.rembg_session)
+            input_image = resize_foreground(input_image, 0.85)
+        elif input_image.mode != "RGBA":
+            # resize_foreground requires RGBA, but if rembg is off and the
+            # image already has no alpha, fabricate a fully-opaque alpha.
+            input_image = input_image.convert("RGBA")
 
-        if run_script.exists():
-            return self._run_via_script(run_script, image_path, preview_path)
-        elif gradio_script.exists():
-            return self._run_via_script(gradio_script, image_path, preview_path)
-        else:
-            print("[WARN] No run.py or gradio_app.py found. Falling back to mock.")
-            return self._mock_generate(image_path, output_dir)
+        with torch.no_grad():
+            mv_image = self.pipeline(
+                input_image,
+                num_inference_steps=DIFFUSION_STEPS,
+            ).images[0]
 
-    def _run_via_script(self, script_path: Path, image_path: str, output_path: str) -> Tuple[str, Optional[str]]:
-        """Run InstantMesh script to generate mesh."""
-        import shutil
-
-        # Create a temp directory for the script output
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Try to run the script
-            # Common patterns:
-            # python run.py --input_image path --output_dir path
-            # python gradio_app.py (need to modify or call functions)
-
-            # First, let's try a direct approach by importing and running
-            try:
-                return self._run_via_import(image_path, output_path)
-            except Exception as e:
-                print(f"[INFO] Import approach failed: {e}")
-
-            # Fallback: Try subprocess with common args
-            cmd = [
-                sys.executable,
-                str(script_path),
-                "--input", image_path,
-                "--output", tmpdir,
-                "--device", DEVICE,
-            ]
-
-            print(f"[INFO] Running: {' '.join(cmd)}")
-
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    cwd=str(INSTANTMESH_CODE_DIR),
-                )
-
-                if result.returncode == 0:
-                    # Find the generated mesh
-                    mesh_files = list(Path(tmpdir).glob("*.obj")) + list(Path(tmpdir).glob("*.glb")) + list(Path(tmpdir).glob("*.ply"))
-                    if mesh_files:
-                        import trimesh
-                        mesh = trimesh.load(str(mesh_files[0]))
-                        mesh.export(output_path)
-                        print(f"[INFO] Generated mesh: {output_path}")
-                        return output_path, None
-                else:
-                    print(f"[WARN] Script failed with code {result.returncode}")
-                    print(f"[WARN] stderr: {result.stderr[:500]}")
-
-            except subprocess.TimeoutExpired:
-                print("[WARN] Script timed out after 120 seconds")
-            except Exception as e:
-                print(f"[WARN] Script execution failed: {e}")
-
-        # If all else fails, mock
-        print("[WARN] All generation methods failed. Using mock.")
-        return self._mock_generate(image_path, os.path.dirname(output_path))
-
-    def _run_via_import(self, image_path: str, output_path: str) -> Tuple[str, Optional[str]]:
-        """Try to import and run InstantMesh directly."""
-        # Save current sys.path
-        original_path = sys.path.copy()
-
+        # Best-effort dump for debugging; never break inference if this fails.
         try:
-            # Add InstantMesh to path
-            if str(INSTANTMESH_CODE_DIR) not in sys.path:
-                sys.path.insert(0, str(INSTANTMESH_CODE_DIR))
+            mv_image.save(os.path.join(output_dir, "multiview.png"))
+            input_image.save(os.path.join(output_dir, "input_processed.png"))
+        except Exception:
+            pass
 
-            # Try to find and import their inference function
-            # This is highly dependent on their code structure
+        # ----- Stage 2: 6 views -> triplane -> mesh ---------------------
+        images_np = np.asarray(mv_image, dtype=np.float32) / 255.0
+        images_t = torch.from_numpy(images_np).permute(2, 0, 1).contiguous().float()
+        images_t = rearrange(images_t, "c (n h) (m w) -> (n m) c h w", n=3, m=2)
+        # images_t now has shape (6, 3, 320, 320) approximately
 
-            # Look for common patterns
-            if (INSTANTMESH_CODE_DIR / "instantmesh" / "pipeline.py").exists():
-                from instantmesh.pipeline import InstantMeshPipeline
-                pipe = InstantMeshPipeline.from_pretrained(str(INSTANTMESH_WEIGHTS_DIR))
-                pipe.to(DEVICE)
+        input_cameras = get_zero123plus_input_cameras(batch_size=1, radius=4.0).to(self.device)
 
-                image = Image.open(image_path).convert("RGB")
-                result = pipe(image)
+        images_t = images_t.unsqueeze(0).to(self.device)
+        images_t = v2.functional.resize(
+            images_t, (320, 320), interpolation=3, antialias=True
+        ).clamp(0, 1)
 
-                if isinstance(result, dict) and "mesh" in result:
-                    mesh = result["mesh"]
-                else:
-                    mesh = result
+        if num_views == 4:
+            view_idx = torch.tensor([0, 2, 4, 5], device=self.device).long()
+            images_t = images_t[:, view_idx]
+            input_cameras = input_cameras[:, view_idx]
 
-                mesh.export(output_path)
-                return output_path, None
+        with torch.no_grad():
+            planes = self.model.forward_planes(images_t, input_cameras)
+            mesh_out = self.model.extract_mesh(
+                planes,
+                use_texture_map=False,
+                **self.config.infer_config,
+            )
 
-        except Exception as e:
-            print(f"[INFO] Import approach error: {e}")
-            raise
+        vertices, faces, vertex_colors = mesh_out
+        # InstantMesh's `app.py` reorients axes to glTF/Three.js (Y-up) before
+        # passing to `save_glb` (which itself flips X/Z to make a right-handed
+        # glTF). We follow the same recipe.
+        vertices = vertices[:, [1, 2, 0]]
+        save_glb(vertices, faces, vertex_colors, preview_path)
 
-        finally:
-            # Restore sys.path
-            sys.path = original_path
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+        print(f"[InstantMesh] Wrote {preview_path}")
+        return preview_path, None
+
+    # ------------------------------------------------------------------
+    # Mock fallback
+    # ------------------------------------------------------------------
     def _mock_generate(self, image_path: str, output_dir: str) -> Tuple[str, Optional[str]]:
-        """Create a simple icosphere as placeholder."""
         import trimesh
+
+        os.makedirs(output_dir, exist_ok=True)
         mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
         preview_path = os.path.join(output_dir, "preview.glb")
         mesh.export(preview_path)
         return preview_path, None
 
 
-# Global singleton
+# Module-level singleton (preserves the existing public import surface).
 coarse_generator = CoarseGenerator()
