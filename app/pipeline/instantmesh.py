@@ -404,6 +404,16 @@ class CoarseGenerator:
             # image already has no alpha, fabricate a fully-opaque alpha.
             input_image = input_image.convert("RGBA")
 
+        # The pipeline may have been offloaded to CPU at the end of the
+        # previous request (see VRAM cleanup below). Move it back before
+        # running diffusion -- a ~1-2 second cost on T4. No-op if it's
+        # already on the target device.
+        if self.device.type == "cuda":
+            try:
+                self.pipeline.to(self.device)
+            except Exception:
+                pass
+
         with torch.no_grad():
             mv_image = self.pipeline(
                 input_image,
@@ -416,6 +426,20 @@ class CoarseGenerator:
             input_image.save(os.path.join(output_dir, "input_processed.png"))
         except Exception:
             pass
+
+        # We're done with the diffusion pipeline for this request -- offload
+        # it to CPU and reclaim the ~3 GB of VRAM it's hogging. The
+        # reconstruction model below (FlexiCubes mesh extraction in
+        # particular) is memory-hungry and needs every byte we can spare on
+        # smaller GPUs (Colab T4 = 16 GB). The next request will move the
+        # pipeline back to CUDA before generating views -- a ~1-2 second
+        # round-trip that's negligible compared to the 50 s diffusion step.
+        if self.device.type == "cuda":
+            try:
+                self.pipeline.to("cpu")
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
 
         # ----- Stage 2: 6 views -> triplane -> mesh ---------------------
         images_np = np.asarray(mv_image, dtype=np.float32) / 255.0

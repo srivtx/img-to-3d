@@ -327,7 +327,15 @@ env["DEVICE"] = "cuda"
 env["USE_INSTANTMESH"] = "true"
 env["FP16"] = "true"
 env["KEEP_MODELS_IN_MEMORY"] = "true"
-env["INSTANTMESH_CONFIG"] = "instant-mesh-large"
+# instant-mesh-base fits comfortably on a Colab T4 (16 GB).
+# instant-mesh-large needs >=24 GB during FlexiCubes mesh extraction
+# (one torch.index_select alone allocates ~15 GB) and OOMs on T4.
+# If you're on an A100 / V100 (40+ GB), feel free to switch to
+# "instant-mesh-large" for slightly higher mesh fidelity.
+env["INSTANTMESH_CONFIG"] = "instant-mesh-base"
+# Help PyTorch defragment its allocator -- avoids spurious OOMs from
+# fragmentation when the diffusion pipeline + recon model share VRAM.
+env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 server_log_path = "/content/server.log"
 server_log_file = open(server_log_path, "w", buffering=1)
