@@ -1,8 +1,15 @@
 # Fast Image-to-3D Generation Server
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/srivtx/img-to-3d/blob/main/colab/Image_to_3D_Generator.ipynb)
+
 Progressive (coarse → fine) image-to-3D generation API + web UI.
 
 **Current status:** Full UI/API works. Mock mode = placeholder sphere. Real 3D requires InstantMesh setup below.
+
+**Quick options:**
+- 🚀 **[Open in Colab](https://colab.research.google.com/github/srivtx/img-to-3d/blob/main/colab/Image_to_3D_Generator.ipynb)** — Free T4 GPU, run in 5 minutes
+- 🐳 [Deploy to Hugging Face Spaces](HUGGINGFACE_DEPLOY.md) — Persistent URL, use your credits
+- 💻 [Run locally](#quick-start-works-immediately) — Your Mac, no setup
 
 ---
 
