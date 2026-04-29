@@ -26,7 +26,7 @@ from app.core.config import MODELS_DIR, DEVICE, FP16
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-USE_INSTANTMESH = False  # <<<< SET TO TRUE AFTER SETUP
+USE_INSTANTMESH = os.getenv("USE_INSTANTMESH", "false").lower() == "true"
 
 # Path to InstantMesh code (relative to project root)
 INSTANTMESH_CODE_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "InstantMesh"
