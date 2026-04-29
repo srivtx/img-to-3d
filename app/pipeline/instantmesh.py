@@ -74,7 +74,25 @@ def _try_import_instantmesh():
         except ImportError:
             pass
 
-        # Option 3: Run.py exists (they use scripts)
+        # Option 3: Try importing from src directory (old structure)
+        try:
+            from src.models.mesh_fusion import quick_voxel_and_mesh
+            _HAS_INSTANTMESH = True
+            print("[INFO] Imported from src.models.mesh_fusion")
+            return
+        except ImportError:
+            pass
+
+        # Option 4: Try importing lgm_model directly
+        try:
+            from src.models.lgm_model import LGMModel
+            _HAS_INSTANTMESH = True
+            print("[INFO] Imported LGMModel")
+            return
+        except ImportError:
+            pass
+
+        # Option 5: Check if run.py exists (they use scripts)
         run_script = INSTANTMESH_CODE_DIR / "run.py"
         if run_script.exists():
             _HAS_INSTANTMESH = True
