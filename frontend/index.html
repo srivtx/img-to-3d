@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <title>Fast Image-to-3D</title>
+    <link rel="stylesheet" href="/static/style.css?v=2">
+    <!-- Three.js -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Image to 3D Generator</h1>
+            <p class="subtitle">Upload an image, get a 3D model in seconds</p>
+        </header>
+
+        <div class="main-layout">
+            <!-- Left panel: Upload & Status -->
+            <div class="panel upload-panel">
+                <div class="upload-zone" id="uploadZone">
+                    <input type="file" id="fileInput" class="file-input" accept="image/jpeg,image/png,image/webp">
+                    <div class="upload-content">
+                        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <p class="upload-text">Drop an image here or click to browse</p>
+                        <p class="upload-hint">JPG, PNG, WebP (max 10MB)</p>
+                    </div>
+                </div>
+
+                <div class="status-card" id="statusCard" style="display: none;">
+                    <div class="status-header">
+                        <span class="status-badge" id="statusBadge">Pending</span>
+                        <span class="status-time" id="statusTime"></span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                    </div>
+                    <p class="status-message" id="statusMessage">Waiting to start...</p>
+                    <div class="model-actions" id="modelActions" style="display: none;">
+                        <a id="previewDownload" class="btn btn-secondary" download>Download Preview</a>
+                        <a id="finalDownload" class="btn btn-primary" download style="display: none;">Download Final</a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right panel: 3D Viewer -->
+            <div class="panel viewer-panel">
+                <div class="viewer-header">
+                    <h3>3D Preview</h3>
+                    <div class="viewer-controls">
+                        <button id="resetView" class="btn-icon" title="Reset view">&#8634;</button>
+                        <button id="toggleWireframe" class="btn-icon" title="Toggle wireframe">&#9630;</button>
+                    </div>
+                </div>
+                <div class="viewer-container" id="viewerContainer">
+                    <div class="viewer-placeholder" id="viewerPlaceholder">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+                            <path d="M2 17l10 5 10-5"></path>
+                            <path d="M2 12l10 5 10-5"></path>
+                        </svg>
+                        <p>Your 3D model will appear here</p>
+                    </div>
+                    <canvas id="viewerCanvas" style="display: none;"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/static/app.js?v=3"></script>
+</body>
+</html>
