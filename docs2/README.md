@@ -1,64 +1,124 @@
-# docs2/ — The Complete Beginner's Guide to Image-to-3D
+# docs2/ — The Ground-Up Learning Path
 
-## What is this folder?
+## What Makes This Different?
 
-This is the **deep, slow, no-shortcuts** explanation of everything we built, everything that broke, and everything we learned.
+**docs/** (written by Claude) = Technical reference for people who already know backend development.  
+**docs2/** (this folder) = Educational curriculum for people who don't.
 
-**docs/** (the sibling folder) was written by Claude. It's excellent and technical.  
-**docs2/** is written by us — it's the version we wish we had on day zero, when we didn't know what a GPU was.
-
----
-
-## How to read this
-
-**Don't skip ahead.** Each part builds on the previous one.
-
-| Part | Title | What you'll understand |
-|------|-------|----------------------|
-| [Part 0](part-00-philosophy.md) | Philosophy: Why We Go Slow | Why complexity must be earned, not given |
-| [Part 1](part-01-what-is-3d.md) | What is 3D? | Vertices, polygons, meshes, files — from zero |
-| [Part 2](part-02-what-is-ai.md) | What is AI/ML? | Neural networks, diffusion, feed-forward — explained simply |
-| [Part 3](part-03-the-web.md) | How the Web Works | Browsers, servers, APIs, HTTP — the plumbing |
-| [Part 4](part-04-our-architecture.md) | What We Built | The full architecture, explained piece by piece |
-| [Part 5](part-05-everything-that-broke.md) | Everything That Broke | Every error, why it happened, how we fixed it |
-| [Part 6](part-06-alternative-architectures.md) | 20+ Other Ways to Build This | Architecture alternatives from beginner to advanced |
-| [Part 7](part-07-glossary.md) | Glossary | Every term defined simply |
+Every part has:
+- **Runnable code exercises** you type yourself
+- **Why explanations** not just what
+- **Multiple angles** on every decision
+- **Progressive complexity** — no shortcuts
 
 ---
 
-## Who this is for
+## Learning Path
 
-- **Absolute beginners** who've never touched 3D or AI
-- **Developers** who know Python but not ML pipelines
-- **Your future self** who will forget why you made every decision
-- **Anyone who inherits this project** and needs to understand it deeply
-
----
-
-## The core idea of this project
-
-**Traditional 3D creation:** Hours in Blender, sculpting vertex by vertex.  
-**Our approach:** Upload one photo. Get a 3D model in 10 seconds.
-
-We don't generate perfect 3D in one step. Instead:
-1. **Coarse model** — fast, approximate, ugly but recognizable (~2 seconds)
-2. **Refinement** — improve shape and smoothness in background (~10 seconds)
-3. **Progressive delivery** — user sees something immediately, quality improves over time
-
-This is called a **coarse-to-fine pipeline**.
+| Part | Title | What You'll Learn |
+|------|-------|-------------------|
+| [Part A](part-a-backend-foundations.md) | Backend Foundations | HTTP, sockets, JSON, file uploads, static files — by building them from scratch |
+| [Part B](part-b-async-concurrency.md) | Async, Concurrency, Polling | Why blocking is bad, threading vs asyncio, the GIL, event loops, polling vs WebSocket vs SSE |
+| [Part C](part-c-ai-inference-deep-dive.md) | AI Inference Line-by-Line | How diffusion creates images, how Zero123 generates views, how LRM reconstructs 3D, how FlexiCubes extracts meshes |
+| [Part D](part-d-build-from-scratch.md) | Build-From-Scratch Exercises | 8 hands-on exercises: raw HTTP server, job queue, polling client, Three.js viewer, file uploads, mock AI pipeline, health dashboard, diffusion simulator |
+| [Part E](part-e-architecture-debates.md) | Architecture Debates | 10 decision records with pros/cons: mock vs real first, FastAPI vs Flask, polling vs WebSocket, in-memory vs Redis, monolith vs microservices |
+| [Part F](part-f-advanced-topics.md) | Advanced Topics | Quantization, distillation, fine-tuning, test-time optimization, NeRF, Gaussian Splatting, ethics, the future |
 
 ---
 
-## The hard truth we learned
+## How to Use These Docs
 
-We spent days trying to make this work. We learned that:
-
-1. **AI models are easy to find, hard to wire** — InstantMesh exists, but connecting it to a web server is 90% of the work
-2. **The error is never where you think** — We thought the model was broken. Actually, our import path was wrong.
-3. **Subprocess is often better than import** — Running a Python script as a command is more reliable than trying to import its modules
-4. **GPU memory is precious** — 16GB sounds like a lot until you load a 4GB model, 2GB of dependencies, and 8GB of intermediate tensors
-5. **Web + ML = two different worlds** — The browser speaks JavaScript. The GPU speaks CUDA. Making them talk is the whole job.
+1. **Read in order.** Each part builds on the previous.
+2. **Type the code.** Don't copy-paste. Muscle memory matters.
+3. **Break things.** Change values, remove lines, see what happens.
+4. **Do the exercises.** They're the actual learning.
+5. **Come back later.** These docs work as reference too.
 
 ---
 
-Let's begin.
+## Time Investment
+
+| Part | Reading | Exercises | Total |
+|------|---------|-----------|-------|
+| A | 1 hour | 2 hours | 3 hours |
+| B | 1 hour | 2 hours | 3 hours |
+| C | 1.5 hours | 1 hour | 2.5 hours |
+| D | 0.5 hours | 4 hours | 4.5 hours |
+| E | 1 hour | 0 hours | 1 hour |
+| F | 1 hour | 0 hours | 1 hour |
+| **Total** | **6 hours** | **9 hours** | **15 hours** |
+
+**15 hours of focused work = solid understanding of the entire stack.**
+
+---
+
+## Prerequisites
+
+- Python installed (3.10+)
+- Basic Python knowledge (variables, functions, loops)
+- Curiosity and patience
+
+**No 3D experience needed.**  
+**No AI experience needed.**  
+**No backend experience needed.**
+
+We start from zero.
+
+---
+
+## Quick Start
+
+```bash
+# Clone the repo
+git clone https://github.com/srivtx/img-to-3d.git
+cd img-to-3d
+
+# Install dependencies
+pip install fastapi uvicorn python-multipart
+
+# Read Part A
+open docs2/part-a-backend-foundations.md
+```
+
+---
+
+## What You'll Be Able to Do After
+
+1. **Explain** how a web server works (not just "it serves pages")
+2. **Build** a job queue system with async workers
+3. **Implement** polling with exponential backoff
+4. **Understand** how diffusion models create images from noise
+5. **Describe** the full pipeline from photo to 3D mesh
+6. **Compare** 25 different architectures for image-to-3D
+7. **Decide** when to use polling vs WebSocket vs SSE
+8. **Optimize** models with quantization and distillation
+9. **Discuss** the ethical implications of generative AI
+
+---
+
+## The Core Philosophy (Repeated)
+
+> Build one layer at a time. Make it work. Then add the next layer. Complexity is earned, not given.
+
+Our app started as a button that showed a sphere. Then we added uploads. Then progress bars. Then a 3D viewer. Then real AI. Each layer worked before we added the next.
+
+**You can do the same.** Start with Exercise 1 in Part D. Build a raw HTTP server. It takes 20 minutes. Then keep going.
+
+---
+
+## Need Help?
+
+- **Read the code:** `app/main.py`, `app/pipeline/instantmesh.py`, `frontend/app.js`
+- **Check the logs:** Server output tells you everything
+- **Use the health endpoint:** `GET /health` shows system status
+- **Start simple:** If something breaks, test components in isolation
+
+---
+
+## License
+
+These docs are part of the img-to-3d project. See root LICENSE.
+
+---
+
+*Built with care for learners who will become builders.*
