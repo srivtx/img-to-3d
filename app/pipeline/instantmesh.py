@@ -12,16 +12,16 @@ Environment variables:
 
 import os
 import sys
-import warnings
+import subprocess
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Tuple, Optional
 
 import torch
-import numpy as np
 from PIL import Image
 
-from app.core.config import MODELS_DIR, DEVICE, FP16
+from app.core.config import DEVICE, FP16
 
 # ============================================================================
 # CONFIGURATION
@@ -29,92 +29,37 @@ from app.core.config import MODELS_DIR, DEVICE, FP16
 USE_INSTANTMESH = os.getenv("USE_INSTANTMESH", "false").lower() == "true"
 
 # Path to InstantMesh code (relative to project root)
-INSTANTMESH_CODE_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "InstantMesh"
-INSTANTMESH_WEIGHTS_DIR = Path(__file__).resolve().parent.parent.parent / "models" / "instantmesh"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+INSTANTMESH_CODE_DIR = PROJECT_ROOT / "models" / "InstantMesh"
+INSTANTMESH_WEIGHTS_DIR = PROJECT_ROOT / "models" / "instantmesh"
 
-# ============================================================================
-# Try to import InstantMesh modules
-# ============================================================================
-_HAS_INSTANTMESH = False
-_INSTANTMESH_ERROR = None
 
-def _try_import_instantmesh():
-    """Attempt to import InstantMesh from various possible locations."""
-    global _HAS_INSTANTMESH, _INSTANTMESH_ERROR
-
+def _check_instantmesh_setup() -> Tuple[bool, str]:
+    """Check if InstantMesh is properly set up."""
     if not USE_INSTANTMESH:
-        _INSTANTMESH_ERROR = "USE_INSTANTMESH env var is not set to 'true'"
-        return
+        return False, "USE_INSTANTMESH env var is not set to 'true'"
 
     if not INSTANTMESH_CODE_DIR.exists():
-        _INSTANTMESH_ERROR = f"InstantMesh code not found at {INSTANTMESH_CODE_DIR}. Run: cd models && git clone https://github.com/TencentARC/InstantMesh.git"
-        return
+        return False, f"InstantMesh code not found at {INSTANTMESH_CODE_DIR}"
 
-    # Add InstantMesh to Python path
-    if str(INSTANTMESH_CODE_DIR) not in sys.path:
-        sys.path.insert(0, str(INSTANTMESH_CODE_DIR))
+    if not INSTANTMESH_WEIGHTS_DIR.exists():
+        return False, f"Weights not found at {INSTANTMESH_WEIGHTS_DIR}"
 
-    # Try to find the pipeline or main module
-    try:
-        # Option 1: They have a pipeline module
-        try:
-            from instantmesh.pipeline import InstantMeshPipeline
-            _HAS_INSTANTMESH = True
-            print("[INFO] Imported InstantMeshPipeline from instantmesh.pipeline")
-            return
-        except ImportError:
-            pass
+    weight_files = list(INSTANTMESH_WEIGHTS_DIR.iterdir())
+    if len(weight_files) == 0:
+        return False, f"Weights directory is empty: {INSTANTMESH_WEIGHTS_DIR}"
 
-        # Option 2: Direct module import
-        try:
-            import instantmesh
-            _HAS_INSTANTMESH = True
-            print("[INFO] Imported instantmesh module")
-            return
-        except ImportError:
-            pass
-
-        # Option 3: Try importing from src directory (old structure)
-        try:
-            from src.models.mesh_fusion import quick_voxel_and_mesh
-            _HAS_INSTANTMESH = True
-            print("[INFO] Imported from src.models.mesh_fusion")
-            return
-        except ImportError:
-            pass
-
-        # Option 4: Try importing lgm_model directly
-        try:
-            from src.models.lgm_model import LGMModel
-            _HAS_INSTANTMESH = True
-            print("[INFO] Imported LGMModel")
-            return
-        except ImportError:
-            pass
-
-        # Option 5: Check if run.py exists (they use scripts)
-        run_script = INSTANTMESH_CODE_DIR / "run.py"
-        if run_script.exists():
-            _HAS_INSTANTMESH = True
-            print("[INFO] Found InstantMesh run.py script")
-            return
-
-        _INSTANTMESH_ERROR = "InstantMesh code found but could not import any known module. Check the repo structure."
-
-    except Exception as e:
-        _INSTANTMESH_ERROR = f"Import error: {str(e)}"
-        traceback.print_exc()
-
-_try_import_instantmesh()
+    return True, f"Found {len(weight_files)} weight files"
 
 
 class CoarseGenerator:
     """Lazy-loaded singleton for coarse 3D generation."""
 
     _instance = None
-    _pipeline = None
     _loaded = False
     _using_mock = False
+    _setup_ok = False
+    _setup_msg = ""
 
     def __new__(cls):
         if cls._instance is None:
@@ -126,67 +71,27 @@ class CoarseGenerator:
         if self._loaded:
             return
 
-        if not USE_INSTANTMESH or not _HAS_INSTANTMESH:
-            print(f"[WARN] Running in MOCK mode. Reason: {_INSTANTMESH_ERROR}")
+        self._setup_ok, self._setup_msg = _check_instantmesh_setup()
+
+        if not self._setup_ok:
+            print(f"[WARN] Running in MOCK mode. Reason: {self._setup_msg}")
             self._using_mock = True
             self._loaded = True
             return
 
+        print("[INFO] InstantMesh setup OK:", self._setup_msg)
         print("[INFO] Loading InstantMesh coarse generator...")
         print(f"[INFO] Device: {DEVICE}")
         print(f"[INFO] Weights dir: {INSTANTMESH_WEIGHTS_DIR}")
 
+        # Check what files are in the weights dir
         try:
-            # Try to load the pipeline
-            self._pipeline = self._load_pipeline()
-            if self._pipeline is not None:
-                print("[INFO] Coarse generator loaded successfully.")
-                self._loaded = True
-            else:
-                raise RuntimeError("Pipeline loaded as None")
-
+            weight_files = list(INSTANTMESH_WEIGHTS_DIR.iterdir())
+            print(f"[INFO] Weight files: {[f.name for f in weight_files[:5]]}")
         except Exception as e:
-            print(f"[ERROR] Failed to load InstantMesh: {e}")
-            traceback.print_exc()
-            print("[WARN] Falling back to MOCK mode.")
-            self._using_mock = True
-            self._loaded = True
+            print(f"[WARN] Could not list weights: {e}")
 
-    def _load_pipeline(self):
-        """Attempt to load the InstantMesh pipeline."""
-        # Try different loading strategies
-
-        # Strategy 1: diffusers-style from_pretrained
-        try:
-            from diffusers import DiffusionPipeline
-            pipe = DiffusionPipeline.from_pretrained(
-                str(INSTANTMESH_WEIGHTS_DIR),
-                torch_dtype=torch.float16 if (FP16 and DEVICE == "cuda") else torch.float32,
-            )
-            pipe = pipe.to(DEVICE)
-            return pipe
-        except Exception as e:
-            print(f"[INFO] DiffusionPipeline loading failed: {e}")
-
-        # Strategy 2: Try importing from instantmesh module directly
-        try:
-            import instantmesh
-            # Look for common function names
-            if hasattr(instantmesh, 'load_pipeline'):
-                return instantmesh.load_pipeline(str(INSTANTMESH_WEIGHTS_DIR), device=DEVICE)
-            elif hasattr(instantmesh, 'InstantMeshPipeline'):
-                pipe = instantmesh.InstantMeshPipeline(str(INSTANTMESH_WEIGHTS_DIR))
-                pipe.to(DEVICE)
-                return pipe
-        except Exception as e:
-            print(f"[INFO] instantmesh module loading failed: {e}")
-
-        # Strategy 3: Check if run.py exists and we can use it as a module
-        run_script = INSTANTMESH_CODE_DIR / "run.py"
-        if run_script.exists():
-            print("[INFO] Found run.py - you may need to implement custom inference")
-
-        raise RuntimeError("Could not load InstantMesh pipeline with any known strategy.")
+        self._loaded = True
 
     def generate(
         self,
@@ -203,7 +108,7 @@ class CoarseGenerator:
         """
         self.load()
 
-        if self._using_mock or not _HAS_INSTANTMESH:
+        if self._using_mock or not self._setup_ok:
             return self._mock_generate(image_path, output_dir)
 
         return self._real_generate(image_path, output_dir, num_views, mesh_size)
@@ -215,69 +120,119 @@ class CoarseGenerator:
         num_views: int = 6,
         mesh_size: int = 384,
     ) -> Tuple[str, Optional[str]]:
-        """Actual InstantMesh inference with MPS fallback."""
-        import trimesh
-
-        image = Image.open(image_path).convert("RGB")
+        """Run InstantMesh via subprocess call."""
         preview_path = os.path.join(output_dir, "preview.glb")
 
-        # Try inference on configured device, fallback to CPU on failure
-        device_for_inference = DEVICE
-        try:
-            mesh = self._run_inference(image, num_views, mesh_size, device_for_inference)
-        except RuntimeError as e:
-            if "MPS" in str(e) or "Metal" in str(e):
-                print(f"[WARN] MPS inference failed ({e}), falling back to CPU...")
-                device_for_inference = "cpu"
-                mesh = self._run_inference(image, num_views, mesh_size, device_for_inference)
-            else:
-                raise
+        # Strategy: Run InstantMesh's run.py or gradio_app.py via subprocess
+        # This is the most reliable way since their API may change
 
-        # Export mesh
-        if hasattr(mesh, 'export'):
-            mesh.export(preview_path)
+        run_script = INSTANTMESH_CODE_DIR / "run.py"
+        gradio_script = INSTANTMESH_CODE_DIR / "gradio_app.py"
+
+        if run_script.exists():
+            return self._run_via_script(run_script, image_path, preview_path)
+        elif gradio_script.exists():
+            return self._run_via_script(gradio_script, image_path, preview_path)
         else:
-            # Convert numpy arrays to mesh if needed
-            vertices = mesh.get("vertices", mesh.get("verts"))
-            faces = mesh.get("faces", mesh.get("faces"))
-            if vertices is not None and faces is not None:
-                trimesh.Trimesh(vertices=vertices, faces=faces).export(preview_path)
-            else:
-                raise ValueError(f"Could not extract mesh data from output type: {type(mesh)}")
+            print("[WARN] No run.py or gradio_app.py found. Falling back to mock.")
+            return self._mock_generate(image_path, output_dir)
 
-        return preview_path, None
+    def _run_via_script(self, script_path: Path, image_path: str, output_path: str) -> Tuple[str, Optional[str]]:
+        """Run InstantMesh script to generate mesh."""
+        import shutil
 
-    def _run_inference(self, image, num_views, mesh_size, device):
-        """Run model inference on specified device."""
-        import torch
+        # Create a temp directory for the script output
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Try to run the script
+            # Common patterns:
+            # python run.py --input_image path --output_dir path
+            # python gradio_app.py (need to modify or call functions)
 
-        with torch.no_grad():
-            # Try different pipeline call patterns
-            if hasattr(self._pipeline, '__call__'):
-                # Standard pipeline call
-                try:
-                    result = self._pipeline(image, num_views=num_views)
-                    if isinstance(result, dict):
-                        return result.get("mesh", result)
-                    return result
-                except TypeError:
-                    # Maybe it doesn't take num_views
-                    result = self._pipeline(image)
-                    if isinstance(result, dict):
-                        return result.get("mesh", result)
-                    return result
+            # First, let's try a direct approach by importing and running
+            try:
+                return self._run_via_import(image_path, output_path)
+            except Exception as e:
+                print(f"[INFO] Import approach failed: {e}")
 
-            elif hasattr(self._pipeline, 'generate_mesh'):
-                return self._pipeline.generate_mesh(image)
+            # Fallback: Try subprocess with common args
+            cmd = [
+                sys.executable,
+                str(script_path),
+                "--input", image_path,
+                "--output", tmpdir,
+                "--device", DEVICE,
+            ]
 
-            elif hasattr(self._pipeline, 'run'):
-                return self._pipeline.run(image)
+            print(f"[INFO] Running: {' '.join(cmd)}")
 
-            else:
-                raise NotImplementedError(
-                    f"Pipeline type {type(self._pipeline)} has no known inference method. "
-                    "Please check the InstantMesh repo for the correct API."
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(INSTANTMESH_CODE_DIR),
                 )
+
+                if result.returncode == 0:
+                    # Find the generated mesh
+                    mesh_files = list(Path(tmpdir).glob("*.obj")) + list(Path(tmpdir).glob("*.glb")) + list(Path(tmpdir).glob("*.ply"))
+                    if mesh_files:
+                        import trimesh
+                        mesh = trimesh.load(str(mesh_files[0]))
+                        mesh.export(output_path)
+                        print(f"[INFO] Generated mesh: {output_path}")
+                        return output_path, None
+                else:
+                    print(f"[WARN] Script failed with code {result.returncode}")
+                    print(f"[WARN] stderr: {result.stderr[:500]}")
+
+            except subprocess.TimeoutExpired:
+                print("[WARN] Script timed out after 120 seconds")
+            except Exception as e:
+                print(f"[WARN] Script execution failed: {e}")
+
+        # If all else fails, mock
+        print("[WARN] All generation methods failed. Using mock.")
+        return self._mock_generate(image_path, os.path.dirname(output_path))
+
+    def _run_via_import(self, image_path: str, output_path: str) -> Tuple[str, Optional[str]]:
+        """Try to import and run InstantMesh directly."""
+        # Save current sys.path
+        original_path = sys.path.copy()
+
+        try:
+            # Add InstantMesh to path
+            if str(INSTANTMESH_CODE_DIR) not in sys.path:
+                sys.path.insert(0, str(INSTANTMESH_CODE_DIR))
+
+            # Try to find and import their inference function
+            # This is highly dependent on their code structure
+
+            # Look for common patterns
+            if (INSTANTMESH_CODE_DIR / "instantmesh" / "pipeline.py").exists():
+                from instantmesh.pipeline import InstantMeshPipeline
+                pipe = InstantMeshPipeline.from_pretrained(str(INSTANTMESH_WEIGHTS_DIR))
+                pipe.to(DEVICE)
+
+                image = Image.open(image_path).convert("RGB")
+                result = pipe(image)
+
+                if isinstance(result, dict) and "mesh" in result:
+                    mesh = result["mesh"]
+                else:
+                    mesh = result
+
+                mesh.export(output_path)
+                return output_path, None
+
+        except Exception as e:
+            print(f"[INFO] Import approach error: {e}")
+            raise
+
+        finally:
+            # Restore sys.path
+            sys.path = original_path
 
     def _mock_generate(self, image_path: str, output_dir: str) -> Tuple[str, Optional[str]]:
         """Create a simple icosphere as placeholder."""

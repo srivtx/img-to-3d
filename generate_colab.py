@@ -141,7 +141,7 @@ def read_tunnel_output():
     for line in iter(tunnel_proc.stdout.readline, ""):
         if not line:
             break
-        match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+        match = re.search(r"https://[a-z0-9-]+\\.trycloudflare\\.com", line)
         if match and not public_url:
             public_url = match.group(0)
             print()
@@ -197,7 +197,9 @@ Your app is running at the URL shown above.
 
 **"CUDA out of memory"** → Restart runtime and run cells again
 
-**"Tunnel not working"** → Check the debug cell below
+**"URL not opening"** → Wait 30 seconds and try again, or check if URL starts with `https://`
+
+**"Still showing mock sphere"** → Check the debug cell below to see server logs
 """)
 
 cell10 = new_code_cell("""# Debug: Show recent server output
@@ -208,7 +210,7 @@ import select
 if server_proc and server_proc.poll() is None:
     ready, _, _ = select.select([server_proc.stdout], [], [], 0.5)
     if ready:
-        for _ in range(10):
+        for _ in range(20):
             line = server_proc.stdout.readline()
             if not line:
                 break
