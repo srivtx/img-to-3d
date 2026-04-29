@@ -36,7 +36,13 @@ cell3 = new_markdown_cell("""
 This downloads the application code, clones InstantMesh, and installs Python packages.
 """)
 
-cell4 = new_code_cell("""# Clone the main repo
+cell4 = new_code_cell("""# Remove existing directory if it exists (from previous run)
+import shutil
+import os
+if os.path.exists("/content/img-to-3d"):
+    shutil.rmtree("/content/img-to-3d")
+
+# Clone the main repo
 !git clone https://github.com/srivtx/img-to-3d.git
 %cd img-to-3d
 
