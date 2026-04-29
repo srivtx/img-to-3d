@@ -19,10 +19,23 @@ def subdivide_mesh(mesh_path: str, iterations: int = 1) -> trimesh.Trimesh:
 def remesh_smooth(mesh: trimesh.Trimesh, target_faces: int = 50000) -> trimesh.Trimesh:
     """
     Remesh to target face count and smooth.
+
+    The face-count reduction step uses ``simplify_quadric_decimation`` which
+    in modern Trimesh delegates to the optional ``fast_simplification``
+    package. If that's not installed we fall back to skipping the
+    decimation -- the resulting mesh is just higher-poly than requested,
+    which is still a perfectly usable GLB. Smoothing and UV generation are
+    pure-trimesh and always run.
     """
     if len(mesh.faces) > target_faces:
-        mesh = mesh.simplify_quadric_decimation(target_faces)
-    
+        try:
+            mesh = mesh.simplify_quadric_decimation(target_faces)
+        except (ImportError, ModuleNotFoundError, ValueError) as e:
+            print(
+                f"[refinement] simplify_quadric_decimation skipped "
+                f"({type(e).__name__}: {e}); keeping {len(mesh.faces)} faces"
+            )
+
     # Taubin smoothing (preserves volume better than Laplacian)
     trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=10)
     return mesh

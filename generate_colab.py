@@ -153,7 +153,8 @@ git_clone_with_retry(
     "imageio" \\
     "ninja" \\
     "diffusers>=0.27,<1.0" \\
-    "transformers>=4.36"
+    "transformers>=4.36" \\
+    "fast-simplification"
 
 # 6. nvdiffrast: builds CUDA kernels from source.
 #

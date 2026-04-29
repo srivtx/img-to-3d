@@ -434,9 +434,21 @@ class CoarseGenerator:
         # smaller GPUs (Colab T4 = 16 GB). The next request will move the
         # pipeline back to CUDA before generating views -- a ~1-2 second
         # round-trip that's negligible compared to the 50 s diffusion step.
+        #
+        # Diffusers warns "Pipelines loaded with dtype=torch.float16 cannot
+        # run with cpu device" when we do this, because it assumes we want
+        # to *run* on CPU. We don't -- we're parking, and we'll move back to
+        # cuda before the next .pipeline(...) call. Suppress the warning so
+        # it doesn't make the server log look like something failed.
         if self.device.type == "cuda":
+            import warnings
             try:
-                self.pipeline.to("cpu")
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=r".*dtype=torch\.float16.*cpu device.*",
+                    )
+                    self.pipeline.to("cpu")
             except Exception:
                 pass
             torch.cuda.empty_cache()
