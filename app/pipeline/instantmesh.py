@@ -62,7 +62,7 @@ WEIGHT_FILES = {
 UNET_FILE = "diffusion_pytorch_model.bin"
 
 
-def _shim_transformers_pytorch_utils() -> None:
+def _shim_transformers_compat() -> None:
     """Re-add helpers that newer transformers (5.x) removed.
 
     InstantMesh's vendored DiNo encoder
@@ -73,21 +73,28 @@ def _shim_transformers_pytorch_utils() -> None:
             prune_linear_layer,
         )
 
-    Those helpers were public-but-internal in transformers <=4.x and
-    were removed/relocated in 5.x as part of a ``pytorch_utils``
-    cleanup. Modern Colab installs transformers 5.x by default, so the
-    import blows up at the very first ``instantiate_from_config`` call
-    on the reconstruction model.
+    and at runtime calls ``self.get_head_mask(...)`` via the
+    ``PreTrainedModel`` base class. All three were public-but-internal
+    helpers in transformers <=4.x and were removed/relocated in 5.x as
+    part of an internal cleanup. Modern Colab installs transformers
+    5.x by default, so:
+
+      * the ``pytorch_utils`` imports break at module-load time
+        (caught at ``instantiate_from_config(config.model_config)``)
+      * the ``get_head_mask`` call breaks at inference time inside
+        ``ViTModel.forward`` (caught at ``model.forward_planes``)
 
     Reimplementing them locally and injecting them into
-    ``transformers.pytorch_utils`` avoids forcing a transformers
-    downgrade (which is slow and risks knock-on dependency conflicts
-    with diffusers / accelerate / huggingface-hub). The implementations
-    here are lifted verbatim from transformers v4.46.0 -- they're tiny,
-    pure-PyTorch helpers with no transformers-version-specific behavior.
+    ``transformers.pytorch_utils`` / ``PreTrainedModel`` avoids forcing
+    a transformers downgrade (which is slow and risks knock-on
+    dependency conflicts with diffusers / accelerate / huggingface-hub).
+    The implementations here are lifted verbatim from transformers
+    v4.46.0 -- they're tiny, pure-PyTorch helpers with no
+    transformers-version-specific behavior.
     """
     try:
         import transformers.pytorch_utils as tpu  # type: ignore
+        from transformers import PreTrainedModel  # type: ignore
     except Exception:
         # transformers itself isn't installed yet; nothing to shim. Whoever
         # called us is about to fail at the next import anyway.
@@ -134,6 +141,32 @@ def _shim_transformers_pytorch_utils() -> None:
             return new_layer
 
         tpu.prune_linear_layer = prune_linear_layer
+
+    if not hasattr(PreTrainedModel, "get_head_mask"):
+        def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+            if head_mask.dim() == 1:
+                head_mask = (
+                    head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                )
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=self.dtype)
+            return head_mask
+
+        def get_head_mask(
+            self, head_mask, num_hidden_layers, is_attention_chunked=False
+        ):
+            if head_mask is not None:
+                head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
+                if is_attention_chunked is True:
+                    head_mask = head_mask.unsqueeze(-1)
+            else:
+                head_mask = [None] * num_hidden_layers
+            return head_mask
+
+        PreTrainedModel._convert_head_mask_to_5d = _convert_head_mask_to_5d  # type: ignore[attr-defined]
+        PreTrainedModel.get_head_mask = get_head_mask  # type: ignore[attr-defined]
 
 
 def _check_setup() -> Tuple[bool, str]:
@@ -238,8 +271,10 @@ class CoarseGenerator:
         # InstantMesh code path imports them. Must run BEFORE we touch
         # `src.models.lrm_mesh` (loaded indirectly via instantiate_from_config
         # below) which transitively imports
-        # `transformers.pytorch_utils.find_pruneable_heads_and_indices`.
-        _shim_transformers_pytorch_utils()
+        # `transformers.pytorch_utils.find_pruneable_heads_and_indices`,
+        # and also patches `PreTrainedModel.get_head_mask` so that the
+        # vendored ViTModel forward pass works at inference time.
+        _shim_transformers_compat()
 
         # All third-party imports live INSIDE this method so that a missing
         # optional dep (e.g. nvdiffrast on a non-CUDA box) raises here and is
