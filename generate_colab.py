@@ -92,27 +92,43 @@ if os.path.exists("/content/img-to-3d"):
 #    deepspeed, diffusers==0.19.3, transformers==4.34.1, torch==2.1.0) that don't
 #    have wheels for the Python 3.12 / torch 2.5+ that current Colab ships, and pip
 #    silently keeps going past the failures, leaving you with rembg / pytorch_lightning /
-#    nvdiffrast / xatlas missing -- which is exactly the failure mode reported.
+#    nvdiffrast / xatlas missing.
 #
-#    Instead we install only the packages our code path actually imports, with
-#    ranges that pip can resolve against whatever torch Colab provides.
+#    rembg is pinned to <2.0.70 because newer rembg requires numpy>=2.3 and
+#    pillow>=12.1 which would force-upgrade the numpy/pillow that Colab has
+#    ALREADY imported in the kernel, triggering "WARNING: you must restart the
+#    runtime" and breaking the rest of this cell. Older rembg has the same API
+#    we use (rembg.new_session, rembg.remove) and accepts whatever numpy/pillow
+#    Colab ships with.
+#
+#    ninja is required for nvdiffrast's CUDA build (next step).
 !pip install \\
     "pytorch-lightning>=2.0" \\
     "omegaconf" \\
     "einops" \\
-    "rembg" \\
+    "rembg>=2.0.50,<2.0.70" \\
     "xatlas" \\
     "plyfile" \\
     "PyMCubes" \\
     "opencv-python" \\
     "imageio" \\
+    "ninja" \\
     "diffusers>=0.27,<1.0" \\
     "transformers>=4.36"
 
-# 6. nvdiffrast: builds CUDA kernels from source. Takes 3-5 min the first time.
-#    This is the ONLY hard CUDA-toolkit-required dep -- failing here means
-#    the server will run in MOCK mode.
-!pip install "git+https://github.com/NVlabs/nvdiffrast/"
+# 6. nvdiffrast: builds CUDA kernels from source.
+#
+#    --no-build-isolation is REQUIRED. nvdiffrast's setup.py imports
+#    torch.utils.cpp_extension; without this flag pip creates an isolated build
+#    env that doesn't have torch and setup.py exits with the (usually invisible)
+#    "ERROR! Cannot compile nvdiffrast CUDA extension. ... You run 'pip install'
+#    with --no-build-isolation flag" message.
+#
+#    This step takes 3-5 minutes of SILENT CUDA compilation. Don't kill it.
+print()
+print(">>> Building nvdiffrast from source. This compiles ~20 CUDA files with")
+print(">>> nvcc and is silent for 3-5 minutes. Please wait, do NOT interrupt.")
+!pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast/"
 
 # 7. Smoke-test imports right now so we surface failures here, not later.
 print()
